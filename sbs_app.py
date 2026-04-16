@@ -1,4 +1,7 @@
-import subprocess, sys, streamlit as st, pandas as pd, calendar, re
+import streamlit as st
+import pandas as pd
+import calendar
+import re
 from datetime import date, timedelta, datetime
 from playwright.sync_api import sync_playwright
 
@@ -19,18 +22,6 @@ CURRENCIES = {
 MONTH_NAMES = ["January","February","March","April","May","June",
                "July","August","September","October","November","December"]
 
-# ── Auto-install Chromium on cloud (runs once per deploy) ─────────────────────
-
-@st.cache_resource(show_spinner="Installing browser (first run only)…")
-def install_browser():
-    subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        capture_output=True
-    )
-    return True
-
-install_browser()
-
 # ── Scraper helpers ───────────────────────────────────────────────────────────
 
 def extract_rate(page, currency_key):
@@ -44,11 +35,14 @@ def extract_rate(page, currency_key):
     return None, None
 
 def extract_mercado_profesional(page):
+    """Return the Tipo de Cambio Mercado Profesional value for Dólar de N.A."""
     try:
         body = page.evaluate("() => document.body.innerText")
+        # The value sits just before "Fuente: BCRP" in the page text
         m = re.search(r'([0-9]+\.[0-9]+)\s*\n?\s*Fuente\s*:\s*BCRP', body)
         if m:
             return m.group(1).strip()
+        # Fallback: last numeric value after "Dólar de N.A." on the page
         m2 = re.findall(r'Dólar de N\.A\.[\s\t]+([0-9]+\.[0-9]+)', body)
         if m2:
             return m2[-1].strip()
@@ -74,17 +68,10 @@ def load_and_query(page, date_str):
     parts = date_str.split('/')
     day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
     try:
-        page.goto(BASE_URL, wait_until="networkidle", timeout=30000)
-        # Wait longer in headless mode for Telerik JS to initialise
-        page.wait_for_timeout(3000)
-        try:
-            page.wait_for_function("typeof $find !== 'undefined'", timeout=8000)
-        except:
-            pass  # Proceed anyway; fallback path handles missing $find
-
+        page.goto(BASE_URL, wait_until="load", timeout=30000)
+        page.wait_for_timeout(500)
         if '404' in page.url or 'error' in page.url.lower():
             return False, 'page_404'
-
         result = page.evaluate(f"""() => {{
             try {{
                 var d = {day}, m = {month}, y = {year};
@@ -102,18 +89,16 @@ def load_and_query(page, date_str):
                 return 'no_telerik';
             }} catch(e) {{ return 'err:' + e.message; }}
         }}""")
-
         if result != 'ok':
             try:
                 inp = page.locator("input[id*='dateInput']").first
                 inp.triple_click()
                 inp.fill(date_str)
                 inp.press("Tab")
-                page.wait_for_timeout(300)
+                page.wait_for_timeout(150)
             except:
                 pass
-
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(200)
         try:
             page.locator("input[value='Consultar']").first.click()
         except:
@@ -124,10 +109,10 @@ def load_and_query(page, date_str):
                 }
             }""")
         try:
-            page.wait_for_load_state("networkidle", timeout=10000)
+            page.wait_for_load_state("load", timeout=10000)
         except:
             pass
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(800)
         return True, result
     except Exception as e:
         return False, str(e)[:60]
@@ -137,10 +122,7 @@ def scrape_range(start_dt, end_dt, currency_key, iso_code, on_progress=None):
     total = (end_dt - start_dt).days + 1
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-        )
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = browser.new_context(viewport={"width": 1280, "height": 900})
         page = ctx.new_page()
 
@@ -160,7 +142,7 @@ def scrape_range(start_dt, end_dt, currency_key, iso_code, on_progress=None):
                 ls = lk.strftime("%d/%m/%Y")
                 ok, _ = load_and_query(page, ls)
                 if not ok:
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(500)
                     continue
                 page_date = get_current_page_date(page)
                 comp, vent = extract_rate(page, currency_key)
@@ -173,6 +155,7 @@ def scrape_range(start_dt, end_dt, currency_key, iso_code, on_progress=None):
                 else:
                     lk -= timedelta(days=1)
 
+            # Clean rate = 1 / mercado_profesional
             clean_rate = ""
             if mercado:
                 try:
@@ -200,7 +183,9 @@ st.set_page_config(page_title="Bespoken Rate — Peru Voes",
                    page_icon="💱", layout="centered")
 
 st.title("💱 Bespoken Rate — Peru Voes")
-st.markdown(f"Source: [Superintendencia de Banca, Seguros y AFP del Perú]({BASE_URL})")
+st.markdown(
+    f"Source: [Superintendencia de Banca, Seguros y AFP del Perú]({BASE_URL})"
+)
 st.divider()
 
 c1, c2, c3 = st.columns(3)
@@ -239,12 +224,13 @@ if st.button("🔍 Fetch Data", type="primary", use_container_width=True):
         stato.error(f"Error: {exc}")
 
 if "rows" in st.session_state:
-    rows   = st.session_state["rows"]
-    iso_s  = st.session_state.get("iso", "USD")
-    mlabel = st.session_state.get("month_label", "")
+    rows        = st.session_state["rows"]
+    iso_s       = st.session_state.get("iso", "USD")
+    mlabel      = st.session_state.get("month_label", "")
 
     st.subheader(st.session_state.get("label", "Results"))
 
+    # ── Raw DataFrame (original columns) ────────────────────────
     raw_df = pd.DataFrame([{
         "date":                r["date"],
         "from_currency":       r["from_currency"],
@@ -254,6 +240,7 @@ if "rows" in st.session_state:
         "mercado_profesional": r["mercado_profesional"],
     } for r in rows])
 
+    # ── Clean DataFrame (formatted output) ──────────────────────
     clean_df = pd.DataFrame([{
         "from_currency":    r["from_currency"],
         "to_currency":      r["to_currency"],
@@ -264,6 +251,7 @@ if "rows" in st.session_state:
         "effective_to":     "",
     } for r in rows])
 
+    # Stats
     valid = clean_df[clean_df["rate"] != ""]
     if not valid.empty:
         m1, m2, m3 = st.columns(3)
@@ -273,9 +261,11 @@ if "rows" in st.session_state:
             m2.metric("Avg rate (1/Mercado Prof.)", f"{rn.mean():.6f}")
             m3.metric("Range", f"{rn.min():.6f} – {rn.max():.6f}")
 
+    # Display clean table
     st.write("**Clean data** — rate = 1 ÷ Mercado Profesional")
     st.dataframe(clean_df, use_container_width=True, hide_index=True, height=380)
 
+    # Two download buttons side by side
     dl1, dl2 = st.columns(2)
     with dl1:
         raw_csv = raw_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
